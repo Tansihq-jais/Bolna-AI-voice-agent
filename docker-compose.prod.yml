@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  voice-platform:
+    build: .
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - BOLNA_API_KEY=${BOLNA_API_KEY}
+      - WEBHOOK_BASE_URL=${WEBHOOK_BASE_URL}
+      - PLATFORM_MARKUP_PER_MIN=${PLATFORM_MARKUP_PER_MIN:-0.02}
+      - BOLNA_BASE_COST_PER_MIN=${BOLNA_BASE_COST_PER_MIN:-0.02}
+      - JWT_SECRET=${JWT_SECRET}
+      - CORS_ORIGIN=${CORS_ORIGIN}
+    volumes:
+      - voice_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/api/agents', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - voice-platform
+    restart: unless-stopped
+
+volumes:
+  voice_data:
+    driver: local
