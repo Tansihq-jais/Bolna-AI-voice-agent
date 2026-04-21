@@ -28,7 +28,7 @@ router.get('/summary', async (req, res) => {
         COUNT(*)                            AS total_calls,
         COALESCE(SUM(duration_seconds), 0) AS total_seconds
       FROM billing
-      WHERE strftime('%Y-%m', billed_at) = ?
+      WHERE TO_CHAR(billed_at, 'YYYY-MM') = $1
     `).get(month) || {};
 
     const totalCalls   = monthly.total_calls   || 0;
@@ -49,7 +49,7 @@ router.get('/summary', async (req, res) => {
         COALESCE(SUM(b.duration_seconds), 0) AS total_seconds
       FROM billing b
       LEFT JOIN campaigns c ON c.id = b.campaign_id
-      WHERE strftime('%Y-%m', b.billed_at) = ?
+      WHERE TO_CHAR(b.billed_at, 'YYYY-MM') = $1
       GROUP BY b.campaign_id, c.name
       ORDER BY total_seconds DESC
     `).all(month) || [];
@@ -68,7 +68,7 @@ router.get('/summary', async (req, res) => {
              COUNT(*)        AS calls,
              COALESCE(SUM(duration_seconds), 0) AS total_seconds
       FROM billing
-      WHERE strftime('%Y-%m', billed_at) = ?
+      WHERE TO_CHAR(billed_at, 'YYYY-MM') = $1
       GROUP BY DATE(billed_at)
       ORDER BY date ASC
     `).all(month) || [];
@@ -82,7 +82,7 @@ router.get('/summary', async (req, res) => {
 
     // Available months for the month picker
     const months = await prepare(`
-      SELECT DISTINCT strftime('%Y-%m', billed_at) AS month
+      SELECT DISTINCT TO_CHAR(billed_at, 'YYYY-MM') AS month
       FROM billing
       ORDER BY month DESC
     `).all() || [];
@@ -115,12 +115,12 @@ router.get('/campaign/:campaignId', async (req, res) => {
     const summary = await prepare(`
       SELECT COUNT(*) AS calls,
         COALESCE(SUM(duration_seconds), 0) AS total_seconds
-      FROM billing WHERE campaign_id = ? AND strftime('%Y-%m', billed_at) = ?
+      FROM billing WHERE campaign_id = $1 AND TO_CHAR(billed_at, 'YYYY-MM') = $2
     `).get(req.params.campaignId, month) || {};
 
     // Get month total to determine rate
     const monthTotal = await prepare(`
-      SELECT COUNT(*) AS total_calls FROM billing WHERE strftime('%Y-%m', billed_at) = ?
+      SELECT COUNT(*) AS total_calls FROM billing WHERE TO_CHAR(billed_at, 'YYYY-MM') = $1
     `).get(month) || {};
 
     const { rate } = getMonthlyRate(monthTotal.total_calls || 0);
@@ -151,7 +151,7 @@ router.post('/estimate', (req, res) => {
     // Get current month's call count to project final total
     const month = currentMonth();
     const monthTotal = prepare(`
-      SELECT COUNT(*) AS total_calls FROM billing WHERE strftime('%Y-%m', billed_at) = ?
+      SELECT COUNT(*) AS total_calls FROM billing WHERE TO_CHAR(billed_at, 'YYYY-MM') = $1
     `).get(month) || {};
 
     const projectedTotal = (monthTotal.total_calls || 0) + contacts;

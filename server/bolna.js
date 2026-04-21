@@ -18,7 +18,9 @@ const bolna = {
   async listAgents(apiKey) {
     const client = getBolnaClient(apiKey);
     const res = await client.get('/v2/agent/all');
-    return res.data;
+    // Normalize: Bolna returns 'id' not 'agent_id'
+    const agents = res.data;
+    return Array.isArray(agents) ? agents.map(a => ({ ...a, agent_id: a.agent_id || a.id })) : agents;
   },
 
   async getAgent(agentId, apiKey) {
@@ -104,7 +106,25 @@ const bolna = {
   async getBatchExecutions(batchId, apiKey) {
     const client = getBolnaClient(apiKey);
     const res = await client.get(`/batches/${batchId}/executions`);
-    return res.data;
+    const executions = res.data;
+    // Normalize duration field: Bolna uses conversation_duration on executions
+    // telephony_data.duration is a string — parse it as fallback
+    if (Array.isArray(executions)) {
+      return executions.map(e => ({
+        ...e,
+        // Unified duration in seconds (rounded to integer)
+        conversation_duration: Math.round(
+          e.conversation_duration
+          || e.conversation_time
+          || parseInt(e.telephony_data?.duration || 0)
+        ),
+        // Unified phone field
+        user_number: e.user_number
+          || e.context_details?.recipient_phone_number
+          || e.telephony_data?.to_number,
+      }));
+    }
+    return executions;
   },
 
   async stopBatch(batchId, apiKey) {
@@ -117,7 +137,18 @@ const bolna = {
   async getExecution(executionId, apiKey) {
     const client = getBolnaClient(apiKey);
     const res = await client.get(`/executions/${executionId}`);
-    return res.data;
+    const e = res.data;
+    return {
+      ...e,
+      conversation_duration: Math.round(
+        e.conversation_duration
+        || e.conversation_time
+        || parseInt(e.telephony_data?.duration || 0)
+      ),
+      user_number: e.user_number
+        || e.context_details?.recipient_phone_number
+        || e.telephony_data?.to_number,
+    };
   },
 
   async getAgentExecutions(agentId, page = 1, pageSize = 50, apiKey) {

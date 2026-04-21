@@ -37,7 +37,12 @@ router.post('/bolna/:campaignId', async (req, res) => {
     }
 
     if (contact) {
-      const duration = payload.conversation_time || 0;
+      // Use conversation_duration (from single execution) or conversation_time (from batch)
+      // telephony_data.duration is a string fallback from Bolna
+      const duration = Math.round(
+        payload.conversation_duration || payload.conversation_time
+        || parseInt(payload.telephony_data?.duration || 0)
+      );
       const bolnaCost = payload.total_cost || 0;
       const platformCost = (duration / 60) * PLATFORM_MARKUP;
       const totalCost = bolnaCost + platformCost;
@@ -80,7 +85,8 @@ router.post('/bolna/:campaignId', async (req, res) => {
           executionId,
           contactNumber: contact.contact_number,
           contactName:   contact.name,
-          transcript:    payload.transcript || '',   // passed to analyzer, never stored
+          transcript:    payload.transcript || '',
+          bolnaSummary:  payload.summary || '',
           callDuration:  duration,
           callStatus:    mappedStatus,
           hangupReason:  payload.telephony_data?.hangup_reason || '',

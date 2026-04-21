@@ -81,6 +81,130 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+// Sync campaign status from Bolna
+router.post('/:id/sync', async (req, res) => {
+  try {
+    const campaign = await db.prepare('SELECT * FROM campaigns WHERE id = ?').get(req.params.id);
+    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+    if (!campaign.batch_id) return res.status(400).json({ success: false, error: 'No batch_id found for this campaign' });
+
+    const apiKey = req.headers['x-bolna-api-key'] || process.env.BOLNA_API_KEY;
+    
+    // Fetch batch status from Bolna
+    console.log('🔄 Syncing batch status from Bolna:', campaign.batch_id);
+    const batchData = await bolna.getBatch(campaign.batch_id, apiKey);
+    console.log('📊 Batch status:', batchData.status);
+    
+    // Fetch executions
+    const executionsData = await bolna.getBatchExecutions(campaign.batch_id, apiKey);
+    console.log('📞 Found', executionsData.length, 'executions');
+    
+    // Update campaign status
+    await db.prepare('UPDATE campaigns SET status = ? WHERE id = ?').run(batchData.status, req.params.id);
+    
+    // Update or insert contacts from executions
+    const PLATFORM_MARKUP_RATE = parseFloat(process.env.PLATFORM_MARKUP_PER_MIN) || 0.02;
+    for (const exec of executionsData) {
+      // Bolna uses user_number or context_details for phone
+      const phoneNumber = exec.user_number || exec.context_details?.recipient_phone_number
+                       || exec.telephony_data?.to_number;
+      const name = exec.context_details?.recipient_data?.name || '';
+      if (!phoneNumber) continue;
+
+      // Bolna returns conversation_duration (seconds) on executions
+      const duration = Math.round(exec.conversation_duration || exec.conversation_time || 0);
+      // telephony_data.duration is a string in seconds from Bolna
+      const telDuration = parseInt(exec.telephony_data?.duration || 0);
+      const finalDuration = duration || telDuration;
+      const bolnaCost = exec.total_cost || 0;
+      const platformCost = (finalDuration / 60) * PLATFORM_MARKUP_RATE;
+      const totalCost = bolnaCost + platformCost;
+
+      // Check if contact exists
+      const existing = await db.prepare('SELECT * FROM contacts WHERE campaign_id = ? AND contact_number = ?').get(req.params.id, phoneNumber);
+      
+      if (existing) {
+        await db.prepare(`
+          UPDATE contacts SET 
+            status = ?,
+            call_duration = ?,
+            call_cost = ?,
+            execution_id = ?,
+            hangup_reason = ?,
+            recording_url = ?,
+            summary = ?,
+            completed_at = CASE WHEN status IN ('completed','failed','no-answer','busy') THEN COALESCE(completed_at, NOW()) ELSE completed_at END
+          WHERE id = ?
+        `).run(
+          exec.status,
+          finalDuration,
+          totalCost,
+          exec.id,
+          exec.telephony_data?.hangup_reason || '',
+          exec.telephony_data?.recording_url || null,
+          exec.summary || null,
+          existing.id
+        );
+        console.log('✅ Updated contact:', phoneNumber, 'status:', exec.status, 'duration:', finalDuration + 's');
+      } else {
+        await db.prepare(`
+          INSERT INTO contacts (id, campaign_id, name, contact_number, status, call_duration, call_cost, execution_id, hangup_reason, recording_url, summary)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          require('uuid').v4(),
+          req.params.id,
+          name,
+          phoneNumber,
+          exec.status,
+          finalDuration,
+          totalCost,
+          exec.id,
+          exec.telephony_data?.hangup_reason || '',
+          exec.telephony_data?.recording_url || null,
+          exec.summary || null
+        );
+        console.log('✅ Created contact:', phoneNumber, 'status:', exec.status, 'duration:', finalDuration + 's');
+      }
+      
+      // Insert billing record if call was completed
+      if (exec.status === 'completed' && finalDuration > 0) {
+        const billingExists = await db.prepare('SELECT * FROM billing WHERE execution_id = ?').get(exec.id);
+        if (!billingExists) {
+          await db.prepare(`
+            INSERT INTO billing (id, campaign_id, execution_id, contact_number, duration_seconds, bolna_cost, platform_cost, total_cost, cost_breakdown)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            require('uuid').v4(),
+            req.params.id,
+            exec.id,
+            phoneNumber,
+            finalDuration,
+            bolnaCost,
+            platformCost,
+            totalCost,
+            JSON.stringify(exec.cost_breakdown || exec.usage_breakdown || {})
+          );
+          console.log('💰 Created billing record for:', phoneNumber);
+        }
+      }
+    }
+    
+    console.log('✅ Sync completed successfully');
+    
+    res.json({ 
+      success: true, 
+      message: `Synced ${executionsData.length} calls`,
+      data: { 
+        batch: batchData,
+        executions: executionsData 
+      } 
+    });
+  } catch (err) {
+    console.error('Sync error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Parse uploaded file (CSV, PDF, or Images) - preview contacts with OCR support
 router.post('/parse-file', upload.single('file'), async (req, res) => {
   try {
@@ -357,19 +481,26 @@ router.post('/', upload.single('file'), async (req, res) => {
       let batchId = null;
       try {
         const fromPhones = from_phone_number ? [from_phone_number] : [];
+        console.log('Creating Bolna batch with agent:', agent_id);
         const batchResult = await bolna.createBatch(agent_id, csvBuffer, 'contacts.csv', fromPhones, webhookUrl, retryConfig, apiKey);
         batchId = batchResult.batch_id;
+        console.log('✅ Bolna batch created:', batchId);
 
         // Schedule if needed
         if (scheduled_at) {
+          console.log('Scheduling batch for:', scheduled_at);
           await bolna.scheduleBatch(batchId, scheduled_at, apiKey);
         } else {
-          // Run now - schedule for 1 minute from now
-          const runAt = new Date(Date.now() + 60000).toISOString();
+          // Run now - schedule for 3 minutes from now (Bolna requires at least 2 min, using 3 for safety)
+          // Format: YYYY-MM-DDTHH:MM:SS (without Z or milliseconds)
+          const runAt = new Date(Date.now() + 180000).toISOString().split('.')[0];
+          console.log('Scheduling batch for immediate run at:', runAt);
           await bolna.scheduleBatch(batchId, runAt, apiKey);
         }
+        console.log('✅ Batch scheduled successfully');
       } catch (bolnaErr) {
-        console.error('Bolna batch error:', bolnaErr.message);
+        console.error('❌ Bolna batch error:', bolnaErr.message);
+        console.error('Bolna error details:', bolnaErr.response?.data || bolnaErr);
         // Continue - save campaign locally even if Bolna fails
       }
 
@@ -455,21 +586,31 @@ router.post('/:id/sync', async (req, res) => {
 
     if (Array.isArray(executions)) {
       for (const exec of executions) {
-        const duration = exec.conversation_time || 0;
+        // Bolna uses conversation_duration (seconds); telephony_data.duration is a string
+        const duration = Math.round(
+          exec.conversation_duration || exec.conversation_time
+          || parseInt(exec.telephony_data?.duration || 0)
+        );
         const bolnaCost = exec.total_cost || 0;
         const platformCost = (duration / 60) * PLATFORM_MARKUP_RATE;
         const totalExecCost = bolnaCost + platformCost;
 
+        // Phone number: user_number is the primary field from Bolna
+        const phoneNumber = exec.user_number || exec.context_details?.recipient_phone_number
+                         || exec.telephony_data?.to_number || '';
+
         await db.prepare(`
-          UPDATE contacts SET status = ?, execution_id = ?, call_duration = ?, call_cost = ?, 
-          transcript = ?, extracted_data = ?, hangup_reason = ?, completed_at = datetime('now')
+          UPDATE contacts SET status = ?, execution_id = ?, call_duration = ?, call_cost = ?,
+          hangup_reason = ?, recording_url = ?, summary = ?,
+          completed_at = CASE WHEN ? IN ('completed','failed','no-answer','busy') THEN COALESCE(completed_at, NOW()) ELSE completed_at END
           WHERE campaign_id = ? AND contact_number = ?
         `).run(
           exec.status || 'completed', exec.id, duration, totalExecCost,
-          exec.transcript || '',
-          exec.extracted_data ? JSON.stringify(exec.extracted_data) : null,
           exec.telephony_data?.hangup_reason || '',
-          campaign.id, exec.telephony_data?.to_number || ''
+          exec.telephony_data?.recording_url || null,
+          exec.summary || null,
+          exec.status || '',
+          campaign.id, phoneNumber
         );
       }
     }

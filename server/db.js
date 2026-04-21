@@ -50,6 +50,8 @@ const initDB = async () => {
         call_cost REAL DEFAULT 0,
         hangup_reason TEXT,
         error_message TEXT,
+        recording_url TEXT,
+        summary TEXT,
         called_at TIMESTAMPTZ,
         completed_at TIMESTAMPTZ
       );

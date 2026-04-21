@@ -10,6 +10,7 @@
  */
 
 const CallInsight = require('../models/CallInsight');
+const MongoDB     = require('../config/mongodb');
 const Groq        = require('groq-sdk');
 const fetch       = require('node-fetch');
 
@@ -23,6 +24,18 @@ function getGroqClient() {
 }
 
 // ─── The structured prompt sent to both Sarvam and Groq ─────────────────────
+// Sarvam-m has a 7192 token context window (~5000 chars of prompt budget after system/structure)
+// Strategy: use Bolna's summary if available, else smart-truncate the transcript
+const MAX_TRANSCRIPT_CHARS = 2500;
+
+function prepareTranscript(transcript) {
+  if (!transcript || transcript.length <= MAX_TRANSCRIPT_CHARS) return transcript;
+  // Take first 1000 chars (opening) + last 1500 chars (closing/outcome) — most signal is here
+  const head = transcript.slice(0, 1000);
+  const tail = transcript.slice(-1500);
+  return `${head}\n...[middle truncated]...\n${tail}`;
+}
+
 function buildPrompt(transcript, callDuration) {
   return `You are an expert sales call analyst. Analyze the following call transcript and return a JSON object with insights.
 
@@ -32,7 +45,7 @@ Call duration: ${callDuration} seconds
 
 Transcript:
 """
-${transcript}
+${prepareTranscript(transcript)}
 """
 
 Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):
@@ -218,12 +231,20 @@ class InsightsAnalyzer {
   static async analyzeCall(callData) {
     const {
       campaignId, contactId, executionId, contactNumber, contactName,
-      transcript, callDuration, callStatus, hangupReason, callCost,
+      transcript, bolnaSummary, callDuration, callStatus, hangupReason, callCost,
       extractedData, agentId, agentName, campaignName,
     } = callData;
 
+    // Use Bolna's pre-built summary as the analysis input when the raw transcript is too large.
+    // Bolna's summary is already concise and fits well within Sarvam's context window.
+    // Fall back to the raw transcript (which gets smart-truncated) if no summary exists.
+    const analysisInput = (bolnaSummary && bolnaSummary.length > 20) ? bolnaSummary : transcript;
+
     // Upsert — safe against duplicate webhook deliveries
-    let insight = await CallInsight.findOne({ executionId });
+    // Only query MongoDB if connected
+    let insight = MongoDB.isConnected()
+      ? await CallInsight.findOne({ executionId })
+      : null;
     if (!insight) {
       insight = new CallInsight({
         campaignId, contactId, executionId,
@@ -250,13 +271,13 @@ class InsightsAnalyzer {
     }
 
     // ── Analyze transcript with 3-tier fallback ──────────────────────────────
-    if (transcript && transcript.length > 20) {
+    if (analysisInput && analysisInput.length > 20) {
       let result   = null;
       let provider = null;
 
       // Tier 1: Sarvam AI
       try {
-        result   = await analyzeWithSarvam(transcript, callDuration);
+        result   = await analyzeWithSarvam(analysisInput, callDuration);
         provider = 'sarvam';
         console.log(`🇮🇳 Sarvam analysis OK for ${executionId} (lang: ${result.detectedLanguage})`);
       } catch (sarvamErr) {
@@ -264,14 +285,14 @@ class InsightsAnalyzer {
 
         // Tier 2: Groq
         try {
-          result   = await analyzeWithGroq(transcript, callDuration);
+          result   = await analyzeWithGroq(analysisInput, callDuration);
           provider = 'groq';
           console.log(`🤖 Groq fallback OK for ${executionId}`);
         } catch (groqErr) {
           console.warn(`⚠️  Groq failed for ${executionId}: ${groqErr.message}`);
 
           // Tier 3: Keywords
-          result   = analyzeWithKeywords(transcript, callDuration);
+          result   = analyzeWithKeywords(analysisInput, callDuration);
           provider = 'keyword';
           console.warn(`🔤 Keyword fallback used for ${executionId}`);
         }
@@ -284,7 +305,13 @@ class InsightsAnalyzer {
     }
 
     insight.calculateLeadScore();
-    await insight.save();
+
+    // Only save to MongoDB if connected — avoids buffering timeout when Atlas is unreachable
+    if (MongoDB.isConnected()) {
+      await insight.save();
+    } else {
+      console.warn(`⚠️  MongoDB not connected — insight for ${executionId} analyzed but not persisted`);
+    }
 
     // Transcript goes out of scope here — never persisted
     return insight;
